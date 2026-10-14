@@ -1,59 +1,189 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
-Description: 'Nested CloudFormation template to create an S3 bucket with versioning and public access blocking'
+Description: |
+  Root CloudFormation template for Monitoring, Alerting & Incident Response on AWS. Creates:
+    - Notifications SNS topic
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Nested Stack Configuration"
+        Parameters:
+          - NestedTemplatesBucketUrl
+      - Label:
+          default: "Common Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - CiSuffix
+      - Label:
+          default: "SNS Topic Configuration"
+        Parameters:
+          - SnsTopicBaseName
+          - TopicType
+          - ContentBasedDeduplication
+      - Label:
+          default: "Access & Encryption Configuration"
+        Parameters:
+          - KmsKeyId
+          - CrossAccountIds
+          - CrossAccountActions
+    ParameterLabels:
+      NestedTemplatesBucketUrl:
+        default: "Nested Templates S3 URL"
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      CiSuffix:
+        default: "CI Suffix"
+      SnsTopicBaseName:
+        default: "SNS Topic Base Name"
+      TopicType:
+        default: "Topic Type"
+      ContentBasedDeduplication:
+        default: "Content-Based Deduplication"
+      KmsKeyId:
+        default: "KMS Key (Alias / ARN / Key ID)"
+      CrossAccountIds:
+        default: "Cross-Account IDs"
+      CrossAccountActions:
+        default: "Cross-Account Actions"
 
 Parameters:
+  NestedTemplatesBucketUrl:
+    Type: String
+    Default: "https://subhamay-cfn-templates-bucket-270453428528-us-east-1.s3.us-east-1.amazonaws.com"
+    Description: "S3 URL base for nested stack templates"
+    MinLength: 10
+
   ProjectName:
     Type: String
-    Description: "Project name to use as a bucket prefix"
+    Default: "proj-ztc"
+    Description: "Project name to use as a topic name prefix"
     MinLength: 1
     MaxLength: 20
     AllowedPattern: "^[a-z0-9-]+$"
     ConstraintDescription: "Project name must be lowercase letters, numbers, and hyphens only"
 
-  BucketBaseName:
-    Type: String
-    Default: cfn-bucket
-    Description: Base name for the S3 bucket (account ID, environment, and region will be appended)
-
-  environment:
+  Environment:
     Type: String
     Default: devl
-    Description: "Deployment environment for the S3 bucket"
+    AllowedValues: [devl, stag, prod]
+    Description: "Deployment environment"
 
   CiSuffix:
     Type: String
     Default: ""
-    Description: "Optional CI prefix to append to the bucket name"
+    Description: "Optional CI suffix to append to the topic name for unique deployments (e.g., pipeline-id)"
+    MaxLength: 30
+    AllowedPattern: "^[a-zA-Z0-9_-]*$"
+    ConstraintDescription: "CI suffix must contain only letters, numbers, hyphens, and underscores"
+
+  SnsTopicBaseName:
+    Type: String
+    Default: "cloud-monitoring-notifications"
+    Description: "Base name for the SNS topic (project and environment are prefixed/appended)"
+    MinLength: 1
+    MaxLength: 60
+    AllowedPattern: "^[a-zA-Z0-9_-]+$"
+    ConstraintDescription: "Base name must contain only letters, numbers, hyphens, and underscores"
+
+  TopicType:
+    Type: String
+    Default: Standard
+    AllowedValues: [Standard, FIFO]
+    Description: "Type of SNS topic to create. FIFO topics get the .fifo suffix appended to the name"
+
+  ContentBasedDeduplication:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: "Enable content-based deduplication (only applies when TopicType is FIFO)"
+
+  KmsKeyId:
+    Type: String
+    Default: 'SB-KMS'
+    AllowedPattern: "^((alias/)?[a-zA-Z0-9/_-]+|arn:aws:kms:[a-z0-9-]+:[0-9]{12}:(key|alias)/[a-zA-Z0-9/_-]+|[a-f0-9-]{36}|mrk-[a-f0-9]{32})?$"
+    ConstraintDescription: "KMS key must be an alias (my-key or alias/my-key), a key ARN (arn:aws:kms:region:account:key/key-id), a key ID, or left empty for no encryption"
+    Description: "Optional KMS key to encrypt the topic (alias with or without alias/ prefix, key ARN, or key ID). Leave empty for no SSE."
+
+  CrossAccountIds:
+    Type: String
+    Default: ''
+    AllowedPattern: "^(\\d{12}(,\\d{12})*)?$"
+    ConstraintDescription: "Provide a comma-separated list of 12-digit AWS account IDs, or leave empty"
+    Description: "Optional comma-separated AWS account IDs granted access to the topic (e.g. 111122223333,444455556666). Leave empty to skip the topic policy."
+
+  CrossAccountActions:
+    Type: String
+    Default: 'sns:Publish'
+    AllowedValues: ['sns:Publish', 'sns:Subscribe', 'sns:Publish,sns:Subscribe']
+    Description: "SNS actions granted to the CrossAccountIds accounts (only used if CrossAccountIds is set)"
 
 Conditions:
-  HasCiSuffix: !Not [!Equals [!Ref CiSuffix, ""]]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyId, '']]
+
+  # KMS key ARNs start with "arn:"
+  KmsKeyIsArn: !Equals [!Select [0, !Split [':', !Ref KmsKeyId]], 'arn']
+
+  # Aliases passed as "alias/my-key" already carry the prefix
+  KmsKeyHasAliasPrefix: !Equals [!Select [0, !Split ['/', !Ref KmsKeyId]], 'alias']
+
+  # Bare alias names (e.g. "my-key") need the "alias/" prefix added
+  KmsKeyNeedsAliasPrefix: !And
+    - !Condition HasKmsKey
+    - !Not [!Condition KmsKeyIsArn]
+    - !Not [!Condition KmsKeyHasAliasPrefix]
 
 Resources:
-  S3Bucket:
-    Type: AWS::S3::Bucket
+  NotificationsSnsNestedStack:
+    Type: AWS::CloudFormation::Stack
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Invokes the nested SNS CloudFormation template to create a notification topic with optional KMS encryption and cross-account access for monitoring and alerting"
+        must:
+          - "Nested template must be accessible at the specified S3 location"
+          - "IAM principal must have s3:GetObject permission on the template S3 bucket"
+          - "CloudFormation service must have permission to create SNS topics and topic policies"
     Properties:
-      BucketName: !If
-        - HasCiSuffix
-        - !Sub '${ProjectName}-${BucketBaseName}-${AWS::AccountId}-${environment}-${AWS::Region}-${CiSuffix}'
-        - !Sub '${ProjectName}-${BucketBaseName}-${AWS::AccountId}-${environment}-${AWS::Region}'
-      VersioningConfiguration:
-        Status: Enabled
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+      TemplateURL: !Sub '${NestedTemplatesBucketUrl}/cfn-nested-aws-sns/template.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        SnsTopicBaseName: !Ref SnsTopicBaseName
+        Environment: !Ref Environment
+        CiSuffix: !Ref CiSuffix
+        TopicType: !Ref TopicType
+        ContentBasedDeduplication: !Ref ContentBasedDeduplication
+        KmsKeyId: !If
+          - KmsKeyNeedsAliasPrefix
+          - !Sub 'alias/${KmsKeyId}'
+          - !Ref KmsKeyId
+        CrossAccountIds: !Ref CrossAccountIds
+        CrossAccountActions: !Ref CrossAccountActions
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Notifications
+        - Key: ManagedBy
+          Value: RootStack
+      TimeoutInMinutes: 10
 
 Outputs:
-  S3BucketName:
-    Description: "Name of the S3 bucket"
-    Value: !Ref S3Bucket
-    Export:
-      Name: !Sub "${AWS::StackName}-BucketName"
+  NotificationsTopicArn:
+    Description: "ARN of the SNS notifications topic for alarm and EventBridge integration"
+    Value: !GetAtt NotificationsSnsNestedStack.Outputs.TopicArn
 
-  S3BucketArn:
-    Description: "ARN of the S3 bucket"
-    Value: !GetAtt S3Bucket.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-BucketArn"
+  NotificationsTopicName:
+    Description: "Name of the SNS notifications topic"
+    Value: !GetAtt NotificationsSnsNestedStack.Outputs.TopicName
+
+  CrossAccountPolicyApplied:
+    Description: "Whether a cross-account topic policy was created"
+    Value: !GetAtt NotificationsSnsNestedStack.Outputs.CrossAccountPolicyApplied
